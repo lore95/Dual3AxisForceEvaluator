@@ -28,90 +28,60 @@ BAUDRATE = 9600
 SYNC_RE = re.compile(r'^SYNC:(\d+)\s*$')
 
 # =========================
-# Calibration configuration
+# Channel / axis mapping
 # =========================
-# Placeholder calibration settings.
-# Replace these when your calibration data arrives.
-#
-# Current behavior:
-#   force_N = CAL_GAIN[channel] * raw_value + CAL_OFFSET[channel]
-#
-# For now, these are identity mappings.
-CAL_GAIN = {
-    "V1": 1.0,
-    "V2": 1.0,
-    "V3": 1.0,
+
+CHANNEL_TO_AXIS = {
+    "V1": "Fx",
+    "V2": "Fy",
+    "V3": "Fz",
 }
 
-CAL_OFFSET = {
-    "V1": 0.0,
-    "V2": 0.0,
-    "V3": 0.0,
+# =========================
+# ADC / calibration constants
+# =========================
+# Assumptions:
+# - ADC is 24-bit signed
+# - Vref = 1.2 V
+# - PGA gain = 128
+# - Incoming V1/V2/V3 serial values are raw ADC counts
+
+VREF = 1.2
+ADC_GAIN = 128
+ADC_BITS = 24
+ADC_MAX_SIGNED = (1 << (ADC_BITS - 1)) - 1  # 8388607
+
+AXIS_CAL = {
+    "V1": 0.980,
+    "V2": 1.004,
+    "V3": 0.724,
 }
 
 
-def calibrate_channel_force(raw_value, channel_name):
+def raw_to_voltage(raw, vref=VREF, gain=ADC_GAIN):
     """
-    Convert one raw sensor value into Newtons.
-
-    Placeholder version:
-        force_N = gain * raw_value + offset
-
-    Replace this later with your real calibration logic once you receive
-    the calibration certificate / calibration file.
-
-    Examples of future replacements:
-      - linear fit from calibration CSV
-      - piecewise interpolation
-      - per-channel polynomial fit
-      - TEDS-derived conversion
+    Convert signed raw ADC count to ADC input voltage in volts.
     """
-    gain = CAL_GAIN.get(channel_name, 1.0)
-    offset = CAL_OFFSET.get(channel_name, 0.0)
-    return float(gain * raw_value + offset)
+    signed = int(raw)
+    full_scale_input = vref / gain
+    return (signed / ADC_MAX_SIGNED) * full_scale_input
 
 
-def load_calibration_from_file(filepath):
+def voltage_to_newtons(voltage, channel_name):
     """
-    Optional helper for later use.
+    Apply the provided calibration formula:
 
-    Expected CSV example:
-        channel,gain,offset
-        V1,0.123,0.0
-        V2,0.121,-0.01
-        V3,0.119,0.005
-
-    You do not need to use this yet. It is here so you can plug in your
-    calibration file later without restructuring the program.
+    V1: ((IN(0))*1000/4000)/((0.980/5000)*10)
+    V2: ((IN(1))*1000/4000)/((1.004/5000)*10)
+    V3: ((IN(2))*1000/4000)/((0.724/5000)*10)
     """
-    if not os.path.isfile(filepath):
-        raise FileNotFoundError(f"Calibration file not found: {filepath}")
+    k = AXIS_CAL[channel_name]
+    return ((voltage * 1000.0 / 4000.0) / ((k / 5000.0) * 10.0))
 
-    loaded_gain = {}
-    loaded_offset = {}
 
-    with open(filepath, newline="") as f:
-        reader = csv.DictReader(f)
-        required = {"channel", "gain", "offset"}
-        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
-            raise ValueError(
-                f"Calibration CSV must contain headers: {sorted(required)}"
-            )
-
-        for row in reader:
-            ch = row["channel"].strip()
-            loaded_gain[ch] = float(row["gain"])
-            loaded_offset[ch] = float(row["offset"])
-
-    for ch in ("V1", "V2", "V3"):
-        if ch in loaded_gain:
-            CAL_GAIN[ch] = loaded_gain[ch]
-        if ch in loaded_offset:
-            CAL_OFFSET[ch] = loaded_offset[ch]
-
-    print("Loaded calibration:")
-    for ch in ("V1", "V2", "V3"):
-        print(f"  {ch}: force_N = {CAL_GAIN[ch]} * raw + {CAL_OFFSET[ch]}")
+def raw_to_newtons(raw, channel_name):
+    voltage = raw_to_voltage(raw)
+    return voltage_to_newtons(voltage, channel_name)
 
 
 # =========================
@@ -202,7 +172,8 @@ class DeviceContext:
     One device:
       - serial connection
       - reader thread
-      - raw/force buffer
+      - live plotting buffer
+      - recording buffer
       - one subplot with 3 channel-force lines
     """
 
@@ -213,11 +184,19 @@ class DeviceContext:
         self.offset_s = offset_s
 
         self.lock = threading.Lock()
-        self.buffer = []
+
+        # live data for plotting
+        self.live_buffer = []
+
+        # current recording chunk only
+        self.record_buffer = []
+
         self.index = 0
+        self.is_recording = False
+        self.save_counter = 0
 
         self.stop_event = threading.Event()
-        self.saved_once = threading.Event()
+        self.finalized_once = threading.Event()
         self.reader_thread = None
 
         self.ax_channels = ax_channels
@@ -235,6 +214,62 @@ class DeviceContext:
         self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self.reader_thread.start()
 
+    def start_recording(self):
+        with self.lock:
+            self.record_buffer = []
+            self.is_recording = True
+
+    def stop_recording_and_save(self):
+        with self.lock:
+            if not self.is_recording:
+                return False
+
+            self.is_recording = False
+            rows = list(self.record_buffer)
+            self.record_buffer = []
+
+        if not rows:
+            print(f"[{self.port}] No recorded data to save.")
+            return False
+
+        return self._write_rows_to_csv(rows)
+
+    def save_active_recording_if_needed(self):
+        with self.lock:
+            rows = list(self.record_buffer) if self.is_recording and self.record_buffer else []
+            self.is_recording = False
+            self.record_buffer = []
+
+        if rows:
+            self._write_rows_to_csv(rows)
+
+    def _write_rows_to_csv(self, rows):
+        try:
+            os.makedirs(SAVE_DIR, exist_ok=True)
+
+            self.save_counter += 1
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{SAVE_DIR}/session_{ts}_{self.port_sanitized}_{self.save_counter:03d}.csv"
+
+            with open(filename, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "host_time_s",
+                    "sample_index",
+                    "v1_raw", "v2_raw", "v3_raw",
+                    "v1_voltage_V", "v2_voltage_V", "v3_voltage_V",
+                    "v1_newtons", "v2_newtons", "v3_newtons"
+                ])
+                for row in rows:
+                    w.writerow(row)
+
+            print(f"[{self.port}] Saved {len(rows)} rows to {filename}")
+            return True
+
+        except Exception as e:
+            print(f"[{self.port}] Failed to save CSV: {e}")
+            return False
+
     def _read_loop(self):
         pattern = re.compile(
             r'Time:(-?\d+),V1:(-?\d+(?:\.\d+)?),'
@@ -251,21 +286,41 @@ class DeviceContext:
                 t_us = int(match.group(1))
                 t_host = (t_us / 1_000_000.0) + self.offset_s
 
-                v1_raw = float(match.group(2))
-                v2_raw = float(match.group(3))
-                v3_raw = float(match.group(4))
+                v1_raw = int(float(match.group(2)))
+                v2_raw = int(float(match.group(3)))
+                v3_raw = int(float(match.group(4)))
 
-                f1 = round(calibrate_channel_force(v1_raw, "V1"), 6)
-                f2 = round(calibrate_channel_force(v2_raw, "V2"), 6)
-                f3 = round(calibrate_channel_force(v3_raw, "V3"), 6)
+                v1_voltage = raw_to_voltage(v1_raw)
+                v2_voltage = raw_to_voltage(v2_raw)
+                v3_voltage = raw_to_voltage(v3_raw)
+
+                v1_newtons = round(raw_to_newtons(v1_raw, "V1"), 6)
+                v2_newtons = round(raw_to_newtons(v2_raw, "V2"), 6)
+                v3_newtons = round(raw_to_newtons(v3_raw, "V3"), 6)
+
+                row = (
+                    t_host,          # [0]
+                    self.index,      # [1]
+                    v1_raw,          # [2]
+                    v2_raw,          # [3]
+                    v3_raw,          # [4]
+                    v1_voltage,      # [5]
+                    v2_voltage,      # [6]
+                    v3_voltage,      # [7]
+                    v1_newtons,      # [8]
+                    v2_newtons,      # [9]
+                    v3_newtons       # [10]
+                )
 
                 with self.lock:
-                    self.buffer.append((
-                        t_host,
-                        self.index,
-                        v1_raw, v2_raw, v3_raw,
-                        f1, f2, f3
-                    ))
+                    self.live_buffer.append(row)
+
+                    if len(self.live_buffer) > PLOT_HISTORY:
+                        self.live_buffer = self.live_buffer[-PLOT_HISTORY:]
+
+                    if self.is_recording:
+                        self.record_buffer.append(row)
+
                     self.index += 1
 
             except Exception as e:
@@ -274,14 +329,14 @@ class DeviceContext:
 
     def update_channels(self):
         with self.lock:
-            if len(self.buffer) < 2:
+            if len(self.live_buffer) < 2:
                 return
 
-            recent = self.buffer[-PLOT_HISTORY:]
+            recent = self.live_buffer[-PLOT_HISTORY:]
             x = [r[0] for r in recent]
-            y1 = [r[5] for r in recent]
-            y2 = [r[6] for r in recent]
-            y3 = [r[7] for r in recent]
+            y1 = [r[8] for r in recent]
+            y2 = [r[9] for r in recent]
+            y3 = [r[10] for r in recent]
 
         self.line_v1.set_data(x, y1)
         self.line_v2.set_data(x, y2)
@@ -292,17 +347,20 @@ class DeviceContext:
 
     def get_force_series(self):
         with self.lock:
-            if not self.buffer:
+            if not self.live_buffer:
                 return [], [], []
-            f1 = [r[5] for r in self.buffer]
-            f2 = [r[6] for r in self.buffer]
-            f3 = [r[7] for r in self.buffer]
+            f1 = [r[8] for r in self.live_buffer]
+            f2 = [r[9] for r in self.live_buffer]
+            f3 = [r[10] for r in self.live_buffer]
         return f1, f2, f3
 
-    def finalize_and_save(self):
-        if self.saved_once.is_set():
+    def finalize_and_close(self):
+        if self.finalized_once.is_set():
             return
-        self.saved_once.set()
+        self.finalized_once.set()
+
+        # save unfinished active recording, if any
+        self.save_active_recording_if_needed()
 
         self.stop_event.set()
         try:
@@ -310,30 +368,6 @@ class DeviceContext:
                 self.reader_thread.join(timeout=2)
         except Exception:
             pass
-
-        with self.lock:
-            rows = list(self.buffer)
-
-        try:
-            os.makedirs(SAVE_DIR, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{SAVE_DIR}/session_{ts}_{self.port_sanitized}.csv"
-
-            with open(filename, "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow([
-                    "host_time_s",
-                    "sample_index",
-                    "v1_raw", "v2_raw", "v3_raw",
-                    "v1_force_N", "v2_force_N", "v3_force_N"
-                ])
-                for row in rows:
-                    t_host, idx, v1_raw, v2_raw, v3_raw, f1, f2, f3 = row
-                    w.writerow([t_host, idx, v1_raw, v2_raw, v3_raw, f1, f2, f3])
-
-            print(f"[{self.port}] Saved {len(rows)} rows to {filename}")
-        except Exception as e:
-            print(f"[{self.port}] Failed to save CSV: {e}")
 
         try:
             self.ser.close()
@@ -353,8 +387,9 @@ CENTER_LINE_V1 = None
 CENTER_LINE_V2 = None
 CENTER_LINE_V3 = None
 
-BTN_STOP = None
+BTN_RECORD = None
 BTN_AX = None
+_RECORDING_ACTIVE = False
 _FINALIZED_ALL = threading.Event()
 
 
@@ -370,8 +405,9 @@ def setup_devices_and_figure():
     """
     Discover boards, sync them, create the figure layout, and start readers.
     """
-    global FIG, DEVICES, BTN_STOP, BTN_AX
+    global FIG, DEVICES, BTN_RECORD, BTN_AX
     global CENTER_AX, CENTER_LINE_V1, CENTER_LINE_V2, CENTER_LINE_V3
+    global _RECORDING_ACTIVE
 
     ports = list_serial_devices()
     opened_pairs = []
@@ -439,23 +475,48 @@ def setup_devices_and_figure():
         ctx.start_reader()
         print(f"[{port}] Reader started.")
 
-    BTN_AX = FIG.add_axes([0.40, 0.02, 0.20, 0.06])
-    BTN_STOP = Button(BTN_AX, "Stop All")
+    BTN_AX = FIG.add_axes([0.36, 0.02, 0.28, 0.06])
+    BTN_RECORD = Button(BTN_AX, "Start Recording")
+    _RECORDING_ACTIVE = False
 
-    def _on_stop_all(_evt=None):
-        try:
-            BTN_STOP.label.set_text("Stopping…")
-            FIG.canvas.draw_idle()
-        except Exception:
-            pass
-        finalize_all_and_exit()
+    def _on_record_toggle(_evt=None):
+        global _RECORDING_ACTIVE
 
-    BTN_STOP.on_clicked(_on_stop_all)
+        if not _RECORDING_ACTIVE:
+            for ctx in DEVICES:
+                ctx.start_recording()
 
-    FIG.canvas.mpl_connect(
-        'key_press_event',
-        lambda e: finalize_all_and_exit() if e.key == 'escape' else None
-    )
+            _RECORDING_ACTIVE = True
+
+            try:
+                BTN_RECORD.label.set_text("Stop Recording")
+                FIG.canvas.draw_idle()
+            except Exception:
+                pass
+
+            print("Recording started.")
+
+        else:
+            any_saved = False
+            for ctx in DEVICES:
+                saved = ctx.stop_recording_and_save()
+                any_saved = any_saved or saved
+
+            _RECORDING_ACTIVE = False
+
+            try:
+                BTN_RECORD.label.set_text("Start Recording")
+                FIG.canvas.draw_idle()
+            except Exception:
+                pass
+
+            if any_saved:
+                print("Recording stopped and saved.")
+            else:
+                print("Recording stopped.")
+
+    BTN_RECORD.on_clicked(_on_record_toggle)
+
     FIG.canvas.mpl_connect('close_event', lambda _evt: finalize_all_and_exit())
 
 
@@ -523,7 +584,7 @@ def finalize_all_and_exit():
 
     for ctx in DEVICES:
         try:
-            ctx.finalize_and_save()
+            ctx.finalize_and_close()
         except Exception as e:
             print(f"[{ctx.port}] finalize error: {e}")
 
@@ -553,3 +614,21 @@ def register_signal_handlers():
     signal.signal(getattr(signal, "SIGTERM", signal.SIGINT), _handle_term)
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _handle_term)
+
+
+# =========================
+# Main
+# =========================
+
+if __name__ == "__main__":
+    register_signal_handlers()
+    setup_devices_and_figure()
+
+    timer = FIG.canvas.new_timer(interval=100)
+    timer.add_callback(update_all, None)
+    timer.start()
+
+    try:
+        plt.show()
+    finally:
+        finalize_all_and_exit()
