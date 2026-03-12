@@ -28,60 +28,70 @@ BAUDRATE = 9600
 SYNC_RE = re.compile(r'^SYNC:(\d+)\s*$')
 
 # =========================
-# Channel / axis mapping
+# Force conversion constants
+# Right sensor:
+#   V1 -> Fx
+#   V2 -> Fy
+#   V3 -> Fz
 # =========================
-
-CHANNEL_TO_AXIS = {
-    "V1": "Fx",
-    "V2": "Fy",
-    "V3": "Fz",
-}
-
-# =========================
-# ADC / calibration constants
-# =========================
-# Assumptions:
-# - ADC is 24-bit signed
-# - Vref = 1.2 V
-# - PGA gain = 128
-# - Incoming V1/V2/V3 serial values are raw ADC counts
 
 VREF = 1.2
-ADC_GAIN = 128
-ADC_BITS = 24
-ADC_MAX_SIGNED = (1 << (ADC_BITS - 1)) - 1  # 8388607
+GAIN = 128
+ADC_FULL_SCALE = 2**23  # signed bipolar ADC
+VEXC = 10.0             # todo check actual bridge excitation voltage
+SENSORDIFFERENTIAL = 10/3.3
+# Right sensor sensitivities (mV/V) to be checked on calibration hbm certificaiton
+SENS_RX = 1.005
+SENS_RY = 1.004
+SENS_RZ = 0.724
 
-AXIS_CAL = {
-    "V1": 0.980,
-    "V2": 1.004,
-    "V3": 0.724,
-}
+# Rated loads (N)
+FX_RATED = 5000.0
+FY_RATED = 5000.0
+FZ_RATED = 20000.0
+
+# First seconds assumed unloaded for zero-offset capture
+ZERO_CAPTURE_SECONDS = 1.0
 
 
-def raw_to_voltage(raw, vref=VREF, gain=ADC_GAIN):
+# =========================
+# Conversion helpers
+# =========================
+
+def adc_to_sensor_voltage(adc_value, adc_zero):
     """
-    Convert signed raw ADC count to ADC input voltage in volts.
+    Convert raw ADC counts to differential sensor voltage in Volts.
     """
-    signed = int(raw)
-    full_scale_input = vref / gain
-    return (signed / ADC_MAX_SIGNED) * full_scale_input
+    return (adc_value - adc_zero) * VREF / (GAIN * ADC_FULL_SCALE)
 
 
-def voltage_to_newtons(voltage, channel_name):
+def sensor_voltage_to_force(v_sensor, sensitivity_mV_per_V, rated_force_N, vexc):
     """
-    Apply the provided calibration formula:
-
-    V1: ((IN(0))*1000/4000)/((0.980/5000)*10)
-    V2: ((IN(1))*1000/4000)/((1.004/5000)*10)
-    V3: ((IN(2))*1000/4000)/((0.724/5000)*10)
+    Convert differential sensor voltage to force in Newtons.
     """
-    k = AXIS_CAL[channel_name]
-    return ((voltage * 1000.0 / 4000.0) / ((k / 5000.0) * 10.0))
+    v_mV = v_sensor * 1000.0 * SENSORDIFFERENTIAL
+    return (v_mV / (sensitivity_mV_per_V * vexc)) * rated_force_N
 
 
-def raw_to_newtons(raw, channel_name):
-    voltage = raw_to_voltage(raw)
-    return voltage_to_newtons(voltage, channel_name)
+def right_sensor_counts_to_newtons(v1_raw, v2_raw, v3_raw, zero_offsets, vexc):
+    """
+    Convert raw ADC counts to forces in Newtons for the RIGHT sensor.
+    Mapping:
+      v1 -> Fx
+      v2 -> Fy
+      v3 -> Fz
+    """
+    z1, z2, z3 = zero_offsets
+
+    vx = adc_to_sensor_voltage(v1_raw, z1)
+    vy = adc_to_sensor_voltage(v2_raw, z2)
+    vz = adc_to_sensor_voltage(v3_raw, z3)
+
+    fx = sensor_voltage_to_force(vx, SENS_RX, FX_RATED, vexc)
+    fy = sensor_voltage_to_force(vy, SENS_RY, FY_RATED, vexc)
+    fz = sensor_voltage_to_force(vz, SENS_RZ, FZ_RATED, vexc)
+
+    return fx, fy, fz
 
 
 # =========================
@@ -199,6 +209,12 @@ class DeviceContext:
         self.finalized_once = threading.Event()
         self.reader_thread = None
 
+        # zero-offset capture state
+        self.zero_capture_start_host = None
+        self.zero_capture_done = False
+        self.zero_samples = []
+        self.zero_offsets = (0.0, 0.0, 0.0)
+
         self.ax_channels = ax_channels
         (self.line_v1,) = self.ax_channels.plot([], [], color='r', label=f"{self.port} V1")
         (self.line_v2,) = self.ax_channels.plot([], [], color='g', label=f"{self.port} V2")
@@ -290,13 +306,39 @@ class DeviceContext:
                 v2_raw = int(float(match.group(3)))
                 v3_raw = int(float(match.group(4)))
 
-                v1_voltage = raw_to_voltage(v1_raw)
-                v2_voltage = raw_to_voltage(v2_raw)
-                v3_voltage = raw_to_voltage(v3_raw)
+                # Capture zero offsets during the first ZERO_CAPTURE_SECONDS
+                if self.zero_capture_start_host is None:
+                    self.zero_capture_start_host = t_host
 
-                v1_newtons = round(raw_to_newtons(v1_raw, "V1"), 6)
-                v2_newtons = round(raw_to_newtons(v2_raw, "V2"), 6)
-                v3_newtons = round(raw_to_newtons(v3_raw, "V3"), 6)
+                if not self.zero_capture_done:
+                    self.zero_samples.append((v1_raw, v2_raw, v3_raw))
+
+                    elapsed = t_host - self.zero_capture_start_host
+                    if elapsed >= ZERO_CAPTURE_SECONDS and len(self.zero_samples) > 0:
+                        arr = np.array(self.zero_samples, dtype=np.float64)
+                        self.zero_offsets = (
+                            float(np.mean(arr[:, 0])),
+                            float(np.mean(arr[:, 1])),
+                            float(np.mean(arr[:, 2]))
+                        )
+                        self.zero_capture_done = True
+                        print(
+                            f"[{self.port}] Zero offsets captured: "
+                            f"V1={self.zero_offsets[0]:.3f}, "
+                            f"V2={self.zero_offsets[1]:.3f}, "
+                            f"V3={self.zero_offsets[2]:.3f}"
+                        )
+                    continue
+
+                # Convert raw counts to corrected sensor voltages
+                v1_voltage_V = adc_to_sensor_voltage(v1_raw, self.zero_offsets[0])
+                v2_voltage_V = adc_to_sensor_voltage(v2_raw, self.zero_offsets[1])
+                v3_voltage_V = adc_to_sensor_voltage(v3_raw, self.zero_offsets[2])
+
+                # Convert corrected counts to forces
+                v1_newtons, v2_newtons, v3_newtons = right_sensor_counts_to_newtons(
+                    v1_raw, v2_raw, v3_raw, self.zero_offsets, VEXC
+                )
 
                 row = (
                     t_host,          # [0]
@@ -304,9 +346,9 @@ class DeviceContext:
                     v1_raw,          # [2]
                     v2_raw,          # [3]
                     v3_raw,          # [4]
-                    v1_voltage,      # [5]
-                    v2_voltage,      # [6]
-                    v3_voltage,      # [7]
+                    v1_voltage_V,    # [5]
+                    v2_voltage_V,    # [6]
+                    v3_voltage_V,    # [7]
                     v1_newtons,      # [8]
                     v2_newtons,      # [9]
                     v3_newtons       # [10]
