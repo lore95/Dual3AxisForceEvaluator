@@ -8,6 +8,9 @@ import os
 import signal
 from datetime import datetime
 
+import tkinter as tk
+from tkinter import ttk, messagebox
+
 import numpy as np
 import serial
 
@@ -16,6 +19,9 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 from matplotlib.gridspec import GridSpec
+
+from calibration import right_sensor_counts_to_newtons, adc_to_sensor_voltage
+from Controller.ble_controller import BLELoopThread, BLEManager
 
 # =========================
 # Constants
@@ -27,72 +33,9 @@ PLOT_HISTORY = 300
 BAUDRATE = 9600
 SYNC_RE = re.compile(r'^SYNC:(\d+)\s*$')
 
-# =========================
-# Force conversion constants
-# Right sensor:
-#   V1 -> Fx
-#   V2 -> Fy
-#   V3 -> Fz
-# =========================
-
-VREF = 1.2
-GAIN = 128
-ADC_FULL_SCALE = 2**23  # signed bipolar ADC
-VEXC = 10.0             # todo check actual bridge excitation voltage
-SENSORDIFFERENTIAL = 10/3.3
-# Right sensor sensitivities (mV/V) to be checked on calibration hbm certificaiton
-SENS_RX = 1.005
-SENS_RY = 1.004
-SENS_RZ = 0.724
-
-# Rated loads (N)
-FX_RATED = 5000.0
-FY_RATED = 5000.0
-FZ_RATED = 20000.0
-
-# First seconds assumed unloaded for zero-offset capture
 ZERO_CAPTURE_SECONDS = 1.0
-
-
-# =========================
-# Conversion helpers
-# =========================
-
-def adc_to_sensor_voltage(adc_value, adc_zero):
-    """
-    Convert raw ADC counts to differential sensor voltage in Volts.
-    """
-    return (adc_value - adc_zero) * VREF / (GAIN * ADC_FULL_SCALE)
-
-
-def sensor_voltage_to_force(v_sensor, sensitivity_mV_per_V, rated_force_N, vexc):
-    """
-    Convert differential sensor voltage to force in Newtons.
-    """
-    v_mV = v_sensor * 1000.0 * SENSORDIFFERENTIAL
-    return (v_mV / (sensitivity_mV_per_V * vexc)) * rated_force_N
-
-
-def right_sensor_counts_to_newtons(v1_raw, v2_raw, v3_raw, zero_offsets, vexc):
-    """
-    Convert raw ADC counts to forces in Newtons for the RIGHT sensor.
-    Mapping:
-      v1 -> Fx
-      v2 -> Fy
-      v3 -> Fz
-    """
-    z1, z2, z3 = zero_offsets
-
-    vx = adc_to_sensor_voltage(v1_raw, z1)
-    vy = adc_to_sensor_voltage(v2_raw, z2)
-    vz = adc_to_sensor_voltage(v3_raw, z3)
-
-    fx = sensor_voltage_to_force(vx, SENS_RX, FX_RATED, vexc)
-    fy = sensor_voltage_to_force(vy, SENS_RY, FY_RATED, vexc)
-    fz = sensor_voltage_to_force(vz, SENS_RZ, FZ_RATED, vexc)
-
-    return fx, fy, fz
-
+VEXC = 10
+BLE_SCAN_TIMEOUT = 6.0
 
 # =========================
 # Serial port conf and opening
@@ -174,23 +117,103 @@ def get_board_time_offset(ser, timeout=2.0):
 
 
 # =========================
+# BLE popup selector
+# =========================
+
+def prompt_user_to_select_ble_devices(devices, max_devices=4, preselect_contains="force"):
+    """
+    devices: list[(address, name)]
+    returns selected list[(address, name)]
+    """
+    if not devices:
+        return []
+
+    root = tk.Tk()
+    root.withdraw()
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Select BLE Devices")
+    dialog.geometry("640x420")
+    dialog.grab_set()
+
+    ttk.Label(
+        dialog,
+        text="No serial devices were found.\nSelect one or more BLE devices to connect:",
+        justify="left"
+    ).pack(anchor="w", padx=12, pady=(12, 8))
+
+    frame = ttk.Frame(dialog, padding=12)
+    frame.pack(fill="both", expand=True)
+
+    listbox = tk.Listbox(frame, selectmode=tk.EXTENDED, height=16)
+    listbox.pack(side="left", fill="both", expand=True)
+
+    scrollbar = ttk.Scrollbar(frame, orient="vertical", command=listbox.yview)
+    scrollbar.pack(side="right", fill="y")
+    listbox.configure(yscrollcommand=scrollbar.set)
+
+    needle = (preselect_contains or "").strip().lower()
+
+    for i, (addr, name) in enumerate(devices):
+        display_name = name or "Unknown"
+        listbox.insert(tk.END, f"{display_name}   ({addr})")
+        if needle and needle in display_name.lower():
+            listbox.selection_set(i)
+
+    result = {"selected": []}
+
+    def on_connect():
+        idxs = listbox.curselection()
+        if not idxs:
+            messagebox.showinfo("Select BLE Devices", "Select at least one BLE device.", parent=dialog)
+            return
+
+        if len(idxs) > max_devices:
+            messagebox.showinfo(
+                "Select BLE Devices",
+                f"You can select at most {max_devices} devices.",
+                parent=dialog
+            )
+            return
+
+        result["selected"] = [devices[i] for i in idxs if 0 <= i < len(devices)]
+        dialog.destroy()
+
+    def on_cancel():
+        result["selected"] = []
+        dialog.destroy()
+
+    btns = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+    btns.pack(fill="x")
+
+    ttk.Button(btns, text="Connect", command=on_connect).pack(side="right")
+    ttk.Button(btns, text="Cancel", command=on_cancel).pack(side="right", padx=(0, 8))
+
+    dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+
+    root.wait_window(dialog)
+    root.destroy()
+    return result["selected"]
+
+
+# =========================
 # Device context
 # =========================
 
 class DeviceContext:
     """
     One device:
-      - serial connection
-      - reader thread
+      - serial connection OR BLE reader
       - live plotting buffer
       - recording buffer
       - one subplot with 3 channel-force lines
     """
 
-    def __init__(self, port, ser, ax_channels, offset_s):
+    def __init__(self, port, ax_channels, offset_s=0.0, ser=None, ble_reader=None):
         self.port = port
         self.port_sanitized = port.replace("/", "_").replace("\\", "_").replace(":", "_")
         self.ser = ser
+        self.ble_reader = ble_reader
         self.offset_s = offset_s
 
         self.lock = threading.Lock()
@@ -227,15 +250,29 @@ class DeviceContext:
         self.ax_channels.legend(loc="upper right")
 
     def start_reader(self):
-        self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
-        self.reader_thread.start()
+        if self.ser is not None:
+            self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+            self.reader_thread.start()
 
     def start_recording(self):
+        if self.ble_reader is not None:
+            return
+
         with self.lock:
             self.record_buffer = []
             self.is_recording = True
 
     def stop_recording_and_save(self):
+        if self.ble_reader is not None:
+            rows = list(self.ble_reader.collected_rows)
+            self.ble_reader.collected_rows.clear()
+
+            if not rows:
+                print(f"[{self.port}] No recorded BLE data to save.")
+                return False
+
+            return self._write_rows_to_csv(rows)
+
         with self.lock:
             if not self.is_recording:
                 return False
@@ -251,6 +288,13 @@ class DeviceContext:
         return self._write_rows_to_csv(rows)
 
     def save_active_recording_if_needed(self):
+        if self.ble_reader is not None:
+            rows = list(self.ble_reader.collected_rows)
+            self.ble_reader.collected_rows.clear()
+            if rows:
+                self._write_rows_to_csv(rows)
+            return
+
         with self.lock:
             rows = list(self.record_buffer) if self.is_recording and self.record_buffer else []
             self.is_recording = False
@@ -370,15 +414,25 @@ class DeviceContext:
                 continue
 
     def update_channels(self):
-        with self.lock:
-            if len(self.live_buffer) < 2:
+        if self.ble_reader is not None:
+            recent = self.ble_reader.live_rows[-PLOT_HISTORY:]
+            if len(recent) < 2:
                 return
 
-            recent = self.live_buffer[-PLOT_HISTORY:]
             x = [r[0] for r in recent]
             y1 = [r[8] for r in recent]
             y2 = [r[9] for r in recent]
             y3 = [r[10] for r in recent]
+        else:
+            with self.lock:
+                if len(self.live_buffer) < 2:
+                    return
+
+                recent = self.live_buffer[-PLOT_HISTORY:]
+                x = [r[0] for r in recent]
+                y1 = [r[8] for r in recent]
+                y2 = [r[9] for r in recent]
+                y3 = [r[10] for r in recent]
 
         self.line_v1.set_data(x, y1)
         self.line_v2.set_data(x, y2)
@@ -388,6 +442,14 @@ class DeviceContext:
         self.ax_channels.autoscale_view()
 
     def get_force_series(self):
+        if self.ble_reader is not None:
+            if not self.ble_reader.live_rows:
+                return [], [], []
+            f1 = [r[8] for r in self.ble_reader.live_rows]
+            f2 = [r[9] for r in self.ble_reader.live_rows]
+            f3 = [r[10] for r in self.ble_reader.live_rows]
+            return f1, f2, f3
+
         with self.lock:
             if not self.live_buffer:
                 return [], [], []
@@ -412,7 +474,8 @@ class DeviceContext:
             pass
 
         try:
-            self.ser.close()
+            if self.ser is not None:
+                self.ser.close()
         except Exception:
             pass
 
@@ -434,6 +497,9 @@ BTN_AX = None
 _RECORDING_ACTIVE = False
 _FINALIZED_ALL = threading.Event()
 
+BLE_THREAD = None
+BLE_MANAGER = None
+
 
 def get_figure():
     return FIG
@@ -446,10 +512,14 @@ def get_figure():
 def setup_devices_and_figure():
     """
     Discover boards, sync them, create the figure layout, and start readers.
+    Falls back to BLE selection popup if no serial devices are usable.
     """
     global FIG, DEVICES, BTN_RECORD, BTN_AX
     global CENTER_AX, CENTER_LINE_V1, CENTER_LINE_V2, CENTER_LINE_V3
     global _RECORDING_ACTIVE
+    global BLE_THREAD, BLE_MANAGER
+
+    DEVICES.clear()
 
     ports = list_serial_devices()
     opened_pairs = []
@@ -460,10 +530,6 @@ def setup_devices_and_figure():
         ser = try_open_serial(p)
         if ser:
             opened_pairs.append((p, ser))
-
-    if not opened_pairs:
-        print("No serial devices found/available.")
-        sys.exit(1)
 
     offset_by_port = {}
     valid_pairs = []
@@ -480,9 +546,36 @@ def setup_devices_and_figure():
             except Exception:
                 pass
 
-    if not valid_pairs:
-        print("No boards successfully synced. Exiting.")
-        sys.exit(1)
+    use_ble = not valid_pairs
+
+    ble_devices = []
+    if use_ble:
+        print("No serial devices found/available. Scanning BLE devices...")
+
+        BLE_THREAD = BLELoopThread()
+        BLE_MANAGER = BLEManager(BLE_THREAD.loop)
+
+        try:
+            all_ble_devices = BLE_THREAD.submit(
+                BLE_MANAGER.scan_devices(timeout=BLE_SCAN_TIMEOUT)
+            ).result(timeout=BLE_SCAN_TIMEOUT + 3.0)
+        except Exception as e:
+            print(f"BLE scan failed: {e}")
+            all_ble_devices = []
+
+        if not all_ble_devices:
+            print("No BLE devices found either. Exiting.")
+            sys.exit(1)
+
+        ble_devices = prompt_user_to_select_ble_devices(
+            all_ble_devices,
+            max_devices=MAX_DEVICES,
+            preselect_contains="force"
+        )
+
+        if not ble_devices:
+            print("No BLE devices selected. Exiting.")
+            sys.exit(1)
 
     FIG = plt.figure(figsize=(14, 9))
     gs = GridSpec(3, 3, figure=FIG, width_ratios=[1, 1.4, 1], height_ratios=[1, 1.2, 1])
@@ -500,22 +593,60 @@ def setup_devices_and_figure():
 
     corner_slots = [(0, 0), (0, 2), (2, 0), (2, 2)]
 
-    for i, (port, ser) in enumerate(valid_pairs):
-        if i >= len(corner_slots):
-            break
+    if not use_ble:
+        for i, (port, ser) in enumerate(valid_pairs):
+            if i >= len(corner_slots):
+                break
 
-        r, c = corner_slots[i]
-        ax_channels = FIG.add_subplot(gs[r, c])
+            r, c = corner_slots[i]
+            ax_channels = FIG.add_subplot(gs[r, c])
 
-        ctx = DeviceContext(
-            port=port,
-            ser=ser,
-            ax_channels=ax_channels,
-            offset_s=offset_by_port[port]
-        )
-        DEVICES.append(ctx)
-        ctx.start_reader()
-        print(f"[{port}] Reader started.")
+            ctx = DeviceContext(
+                port=port,
+                ser=ser,
+                ax_channels=ax_channels,
+                offset_s=offset_by_port[port]
+            )
+            DEVICES.append(ctx)
+            ctx.start_reader()
+            print(f"[{port}] Reader started.")
+    else:
+        for i, (address, name) in enumerate(ble_devices):
+            if i >= len(corner_slots):
+                break
+
+            r, c = corner_slots[i]
+            ax_channels = FIG.add_subplot(gs[r, c])
+
+            try:
+                ok = BLE_THREAD.submit(BLE_MANAGER.connect(address)).result(timeout=25.0)
+            except Exception as e:
+                print(f"[BLE {name}] Connect exception: {e}")
+                ok = False
+
+            if not ok:
+                print(f"[BLE {name}] Failed to connect.")
+                continue
+
+            reader = BLE_MANAGER.readers.get(address)
+            if reader is None:
+                print(f"[BLE {name}] Reader not found after connect.")
+                continue
+
+            reader.name = name
+
+            ctx = DeviceContext(
+                port=f"BLE:{name}",
+                ax_channels=ax_channels,
+                ble_reader=reader,
+                offset_s=0.0
+            )
+            DEVICES.append(ctx)
+            print(f"[BLE:{name}] Reader started.")
+
+    if not DEVICES:
+        print("No usable devices available. Exiting.")
+        sys.exit(1)
 
     BTN_AX = FIG.add_axes([0.36, 0.02, 0.28, 0.06])
     BTN_RECORD = Button(BTN_AX, "Start Recording")
@@ -526,7 +657,13 @@ def setup_devices_and_figure():
 
         if not _RECORDING_ACTIVE:
             for ctx in DEVICES:
-                ctx.start_recording()
+                if ctx.ble_reader is not None:
+                    try:
+                        BLE_THREAD.submit(ctx.ble_reader.start_reading()).result(timeout=5.0)
+                    except Exception as e:
+                        print(f"[{ctx.port}] BLE start_reading failed: {e}")
+                else:
+                    ctx.start_recording()
 
             _RECORDING_ACTIVE = True
 
@@ -541,7 +678,16 @@ def setup_devices_and_figure():
         else:
             any_saved = False
             for ctx in DEVICES:
-                saved = ctx.stop_recording_and_save()
+                if ctx.ble_reader is not None:
+                    try:
+                        filename = BLE_THREAD.submit(ctx.ble_reader.stop_reading()).result(timeout=10.0)
+                        saved = bool(filename)
+                    except Exception as e:
+                        print(f"[{ctx.port}] BLE stop_reading failed: {e}")
+                        saved = False
+                else:
+                    saved = ctx.stop_recording_and_save()
+
                 any_saved = any_saved or saved
 
             _RECORDING_ACTIVE = False
@@ -620,6 +766,8 @@ def update_all(_frame):
 # =========================
 
 def finalize_all_and_exit():
+    global BLE_THREAD, BLE_MANAGER
+
     if _FINALIZED_ALL.is_set():
         return
     _FINALIZED_ALL.set()
@@ -629,6 +777,20 @@ def finalize_all_and_exit():
             ctx.finalize_and_close()
         except Exception as e:
             print(f"[{ctx.port}] finalize error: {e}")
+
+    if BLE_THREAD is not None and BLE_MANAGER is not None:
+        try:
+            BLE_THREAD.submit(BLE_MANAGER.disconnect_all()).result(timeout=10.0)
+        except Exception:
+            pass
+
+        try:
+            BLE_THREAD.stop()
+        except Exception:
+            pass
+
+        BLE_THREAD = None
+        BLE_MANAGER = None
 
     try:
         plt.close(FIG)
@@ -656,21 +818,3 @@ def register_signal_handlers():
     signal.signal(getattr(signal, "SIGTERM", signal.SIGINT), _handle_term)
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _handle_term)
-
-
-# =========================
-# Main
-# =========================
-
-if __name__ == "__main__":
-    register_signal_handlers()
-    setup_devices_and_figure()
-
-    timer = FIG.canvas.new_timer(interval=100)
-    timer.add_callback(update_all, None)
-    timer.start()
-
-    try:
-        plt.show()
-    finally:
-        finalize_all_and_exit()
